@@ -1,0 +1,181 @@
+"""Dataset preparation for token classification. DO NOT MODIFY — this file is read-only."""
+
+import json
+from pathlib import Path
+from collections import Counter
+from datasets import load_dataset, load_from_disk, ClassLabel, Sequence
+from seqeval.metrics import classification_report, f1_score, precision_score, recall_score
+import numpy as np
+
+
+DATASET_NAME = "{{ config.dataset }}"
+DATASET_CONFIG = {% if config.dataset_config %}"{{ config.dataset_config }}"{% else %}None{% endif %}
+EVAL_SPLIT = "{{ config.eval_split }}"
+LANGUAGES = {{ config.languages | tojson if config.languages else "[]" }}
+MAX_SAMPLES = {{ config.max_samples or "None" }}
+TEXT_COLUMN = {% if config.text_column %}"{{ config.text_column }}"{% else %}None{% endif %}
+LABEL_COLUMN = {% if config.label_column %}"{{ config.label_column }}"{% else %}None{% endif %}
+
+
+def _detect_column(features, candidates, kind="column"):
+    """Find the first matching column from candidates."""
+    for name in candidates:
+        if name and name in features:
+            return name
+    raise ValueError(f"Could not find {kind} column. Available: {list(features.keys())}")
+
+
+def _build_label_mapping(dataset, label_col):
+    """Build label list from dataset, handling both ClassLabel and string tags."""
+    features = dataset.features
+
+    # Case 1: HuggingFace ClassLabel (integer-encoded)
+    if hasattr(features[label_col], "feature") and hasattr(features[label_col].feature, "names"):
+        return features[label_col].feature.names
+
+    # Case 2: String BIO tags — collect all unique tags
+    all_tags = set()
+    for example in dataset:
+        for tag in example[label_col]:
+            if isinstance(tag, str):
+                all_tags.add(tag)
+
+    # Sort: O first, then B- tags, then I- tags
+    sorted_tags = sorted(all_tags, key=lambda t: (
+        0 if t == "O" else 1 if t.startswith("B-") else 2,
+        t,
+    ))
+    return sorted_tags
+
+
+def _convert_string_tags_to_ids(dataset, label_col, label_list):
+    """Convert string BIO tags to integer IDs."""
+    tag2id = {tag: i for i, tag in enumerate(label_list)}
+
+    def convert(examples):
+        examples[label_col] = [
+            [tag2id.get(tag, 0) for tag in tags]
+            for tags in examples[label_col]
+        ]
+        return examples
+
+    return dataset.map(convert, batched=True)
+
+
+def load_data():
+    """Load and return train/eval datasets with label list."""
+    # Safeguard check — runs before every training run, cannot be bypassed
+    from guard import check
+    should_stop, reason = check()
+    if should_stop:
+        print(f"\n[GUARD] {reason}")
+        print("[GUARD] Stopping. Do not start another run.")
+        import sys
+        sys.exit(0)
+
+    # Support both HuggingFace Hub datasets and local datasets saved with save_to_disk()
+    if Path(DATASET_NAME).is_dir():
+        print(f"Loading local dataset from: {DATASET_NAME}")
+        ds = load_from_disk(DATASET_NAME)
+    else:
+        print(f"Loading dataset: {DATASET_NAME} (config: {DATASET_CONFIG})")
+        ds = load_dataset(DATASET_NAME, DATASET_CONFIG)
+
+    # Determine splits
+    train_split = "train" if "train" in ds else list(ds.keys())[0]
+    eval_split = EVAL_SPLIT if EVAL_SPLIT in ds else "validation" if "validation" in ds else train_split
+
+    if eval_split == train_split:
+        print(f"WARNING: No separate eval split found, splitting train 90/10")
+        split = ds[train_split].train_test_split(test_size=0.1, seed=42)
+        ds[train_split] = split["train"]
+        ds["_eval"] = split["test"]
+        eval_split = "_eval"
+
+    # Filter by language if specified
+    if LANGUAGES:
+        lang_col = None
+        for candidate in ["language", "lang", "locale"]:
+            if candidate in ds[train_split].column_names:
+                lang_col = candidate
+                break
+
+        if lang_col:
+            print(f"Filtering to languages: {LANGUAGES} (column: {lang_col})")
+            for split_name in [train_split, eval_split]:
+                if split_name in ds or split_name == "_eval":
+                    split_ds = ds[split_name] if split_name != "_eval" else ds["_eval"]
+                    filtered = split_ds.filter(lambda x: x[lang_col] in LANGUAGES)
+                    if split_name == "_eval":
+                        ds["_eval"] = filtered
+                    else:
+                        ds[split_name] = filtered
+        else:
+            print(f"WARNING: No language column found, skipping language filter")
+
+    # Limit samples
+    train_ds = ds[train_split]
+    eval_ds = ds[eval_split] if eval_split != "_eval" else ds["_eval"]
+
+    if MAX_SAMPLES:
+        if len(train_ds) > MAX_SAMPLES:
+            train_ds = train_ds.select(range(MAX_SAMPLES))
+        eval_max = max(MAX_SAMPLES // 5, 100)
+        if len(eval_ds) > eval_max:
+            eval_ds = eval_ds.select(range(eval_max))
+
+    # Detect columns
+    features = train_ds.features
+    print(f"Available columns: {list(features.keys())}")
+
+    text_col = TEXT_COLUMN or _detect_column(features, [
+        "mbert_tokens", "tokens", "words", "input_tokens",
+    ], "text/tokens")
+
+    label_col = LABEL_COLUMN or _detect_column(features, [
+        "mbert_token_classes", "ner_tags", "labels", "tags", "bio_tags",
+    ], "label")
+
+    print(f"Text column: {text_col}")
+    print(f"Label column: {label_col}")
+
+    # Build label list
+    label_list = _build_label_mapping(train_ds, label_col)
+    print(f"Labels ({len(label_list)}): {label_list[:20]}{'...' if len(label_list) > 20 else ''}")
+
+    # Convert string tags to integer IDs if needed
+    sample = train_ds[0][label_col]
+    if sample and isinstance(sample[0], str):
+        print("Converting string BIO tags to integer IDs...")
+        train_ds = _convert_string_tags_to_ids(train_ds, label_col, label_list)
+        eval_ds = _convert_string_tags_to_ids(eval_ds, label_col, label_list)
+
+    print(f"Train: {len(train_ds)} examples")
+    print(f"Eval: {len(eval_ds)} examples")
+
+    return train_ds, eval_ds, label_list, text_col, label_col
+
+
+def evaluate_predictions(predictions, labels, label_list):
+    """Compute F1, precision, recall from predictions and labels."""
+    true_predictions = []
+    true_labels = []
+    for pred, label in zip(predictions, labels):
+        true_pred = []
+        true_lab = []
+        for p, l in zip(pred, label):
+            if l != -100:
+                true_pred.append(label_list[p] if p < len(label_list) else "O")
+                true_lab.append(label_list[l] if l < len(label_list) else "O")
+        true_predictions.append(true_pred)
+        true_labels.append(true_lab)
+
+    return {
+        "f1": f1_score(true_labels, true_predictions),
+        "precision": precision_score(true_labels, true_predictions),
+        "recall": recall_score(true_labels, true_predictions),
+    }
+
+
+if __name__ == "__main__":
+    train, eval_ds, labels, text_col, label_col = load_data()

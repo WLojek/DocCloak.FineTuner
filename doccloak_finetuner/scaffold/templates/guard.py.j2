@@ -1,0 +1,88 @@
+"""Safeguard checker. DO NOT MODIFY — this file enforces stopping conditions."""
+
+import csv
+import sys
+from pathlib import Path
+
+MAX_RUNS = {{ config.max_runs }}
+TARGET_METRIC = {{ config.target_metric or "None" }}
+MAX_NO_IMPROVEMENT = {{ config.max_no_improvement }}
+METRIC_GOAL = "{{ config.metric_goal }}"
+
+RESULTS_FILE = Path("results.tsv")
+
+
+def check() -> tuple[bool, str]:
+    """Returns (should_stop, reason)."""
+    if not RESULTS_FILE.exists():
+        return False, "No results yet."
+
+    rows = []
+    with open(RESULTS_FILE) as f:
+        reader = csv.DictReader(f, delimiter="\t")
+        for row in reader:
+            if row.get("tag") == "FINAL":
+                continue
+            try:
+                row["value"] = float(row["value"])
+                rows.append(row)
+            except (ValueError, KeyError):
+                continue
+
+    if not rows:
+        return False, "No valid results yet."
+
+    total_runs = len(rows)
+    best_value = rows[0]["value"]
+    for row in rows:
+        if METRIC_GOAL == "maximize":
+            best_value = max(best_value, row["value"])
+        else:
+            best_value = min(best_value, row["value"])
+
+    # Check max runs
+    if total_runs >= MAX_RUNS:
+        return True, f"STOP: Max runs reached ({total_runs}/{MAX_RUNS}). Best: {best_value}"
+
+    # Check target metric
+    if TARGET_METRIC is not None:
+        if METRIC_GOAL == "maximize" and best_value >= TARGET_METRIC:
+            return True, f"STOP: Target metric reached ({best_value} >= {TARGET_METRIC})."
+        if METRIC_GOAL == "minimize" and best_value <= TARGET_METRIC:
+            return True, f"STOP: Target metric reached ({best_value} <= {TARGET_METRIC})."
+
+    # Check no-improvement plateau
+    if total_runs >= MAX_NO_IMPROVEMENT:
+        recent = [r["value"] for r in rows[-MAX_NO_IMPROVEMENT:]]
+        if METRIC_GOAL == "maximize":
+            recent_best = max(recent)
+            prior_best = best_value
+        else:
+            recent_best = min(recent)
+            prior_best = best_value
+
+        improved = False
+        for i, r in enumerate(rows[-MAX_NO_IMPROVEMENT:]):
+            before = rows[:total_runs - MAX_NO_IMPROVEMENT + i]
+            if before:
+                if METRIC_GOAL == "maximize":
+                    prev_best = max(b["value"] for b in before)
+                    if r["value"] > prev_best:
+                        improved = True
+                        break
+                else:
+                    prev_best = min(b["value"] for b in before)
+                    if r["value"] < prev_best:
+                        improved = True
+                        break
+
+        if not improved:
+            return True, f"STOP: No improvement in last {MAX_NO_IMPROVEMENT} runs. Best: {best_value}"
+
+    return False, f"CONTINUE: {total_runs}/{MAX_RUNS} runs. Best: {best_value}"
+
+
+if __name__ == "__main__":
+    should_stop, reason = check()
+    print(reason)
+    sys.exit(1 if should_stop else 0)

@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+
+# Generated workspaces (created by `doccloak-finetune init`)
+workspace/
+workspace_*/
+
+# Datasets (download or generate separately)
+datasets/
+
+# Model weights
+*.onnx
+*.pt
+*.bin
+*.safetensors
+
+# User config (use config.herbert.yaml as example)
+config.yaml
+
+# Secrets
+.env
+
+# OS / IDE
+.DS_Store
+.claude/
+.idea/
+.vscode/
+
+# Caches
+.ruff_cache/
+.pytest_cache/
+
+# Export output
+export/
