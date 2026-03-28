@@ -1,6 +1,6 @@
 <h1 align="center">DocCloak.FineTuner</h1>
 
-<p align="center">API-driven autonomous fine-tuning for PII detection models.<br>Part of the DocCloak ecosystem.<br>Inspired by <a href="https://github.com/karpathy/autoresearch">autoresearch</a> by Andrej Karpathy.</p>
+<p align="center">Agentic fine-tuning for NER/PII detection.<br>Part of the DocCloak ecosystem.<br>Inspired by <a href="https://github.com/karpathy/autoresearch">autoresearch</a> by Andrej Karpathy.</p>
 
 Define your candidate models, dataset, and constraints in YAML. DocCloak.FineTuner uses the Anthropic API to drive an autonomous research loop — the agent systematically explores the hyperparameter space, compares model architectures, and converges on the best F1 score. All experiments are logged and git-committed.
 
