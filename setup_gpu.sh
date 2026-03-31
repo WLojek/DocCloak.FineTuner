@@ -10,8 +10,8 @@ set -e
 python -m venv .venv
 source .venv/bin/activate
 
-# Step 2: Install all dependencies
-pip install -e .
+# Step 2: Install all dependencies (including QLoRA + ONNX + GPTQ extras)
+pip install -e ".[qlora,onnx,gptq]"
 
 # Step 3: Detect CUDA driver and reinstall torch with correct version
 if command -v nvidia-smi &>/dev/null; then
@@ -48,8 +48,10 @@ echo ""
 echo "To activate the environment:"
 echo "  source .venv/bin/activate"
 echo ""
-echo "To initialize training workspace:"
-echo "  doccloak-finetune init -c config.herbert.yaml -o workspace_herbert"
+echo "To train Scribe (document generation):"
+echo "  doccloak-finetune init -c config.scribe.yaml -o workspace_scribe"
+echo "  doccloak-finetune run -c config.scribe.yaml -o workspace_scribe"
 echo ""
-echo "To start training:"
+echo "To train NER (PII detection):"
+echo "  doccloak-finetune init -c config.herbert.yaml -o workspace_herbert"
 echo "  doccloak-finetune run -c config.herbert.yaml -o workspace_herbert"

@@ -1,0 +1,340 @@
+"""
+Text generation fine-tuning script for DocCloak Scribe.
+Uses QLoRA for memory-efficient training of causal language models.
+Hyperparameters are set by the orchestrator before each run.
+"""
+
+import json
+import os
+import time
+from pathlib import Path
+
+import torch
+import numpy as np
+from transformers import (
+    AutoTokenizer,
+    AutoModelForCausalLM,
+    TrainingArguments,
+    BitsAndBytesConfig,
+)
+
+from prepare import load_data, format_for_training, compute_rouge, compute_slot_accuracy
+
+# MPS/CUDA memory optimization
+os.environ.setdefault("PYTORCH_MPS_HIGH_WATERMARK_RATIO", "0.0")
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
+# ══════════════════════════════════════════════════════════════════════════
+# CONFIGURATION & HYPERPARAMETERS (set by orchestrator before each run)
+# ══════════════════════════════════════════════════════════════════════════
+
+BASE_MODEL = "{{ config.candidate_models[0] }}"
+TIME_BUDGET_S = {{ config.time_budget_seconds }}
+
+LEARNING_RATE = 2e-5
+BATCH_SIZE = 4
+NUM_EPOCHS = 3
+WARMUP_RATIO = 0.1
+WEIGHT_DECAY = 0.01
+MAX_SEQ_LENGTH = 512
+FREEZE_LAYERS = 0
+GRADIENT_ACCUMULATION_STEPS = 4
+LR_SCHEDULER = "cosine"
+
+# LoRA hyperparameters
+LORA_RANK = {{ config.lora_rank }}
+LORA_ALPHA = {{ config.lora_alpha }}
+LORA_DROPOUT = {{ config.lora_dropout }}
+MAX_NEW_TOKENS = {{ config.max_new_tokens }}
+
+# ══════════════════════════════════════════════════════════════════════════
+
+start_time = time.time()
+
+
+def remaining_time():
+    return TIME_BUDGET_S - (time.time() - start_time)
+
+
+def detect_device():
+    if torch.cuda.is_available():
+        return "cuda"
+    if torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
+DEVICE = detect_device()
+
+
+def count_params_millions(model) -> float:
+    return sum(p.numel() for p in model.parameters()) / 1e6
+
+
+def count_trainable_params_millions(model) -> float:
+    return sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6
+
+
+def measure_model_size_mb(model) -> float:
+    """Estimated model size in MB (mixed precision)."""
+    total_params = sum(p.numel() for p in model.parameters())
+    # Approximate: 4-bit quantized base + fp16 LoRA adapters
+    return (total_params * 0.5) / (1024 ** 2)  # rough estimate
+
+
+def main():
+    print(f"Time budget: {TIME_BUDGET_S}s")
+    print(f"Device: {DEVICE}")
+    print(f"Model: {BASE_MODEL}")
+    print(f"LR: {LEARNING_RATE}, Batch: {BATCH_SIZE}, Epochs: {NUM_EPOCHS}")
+    print(f"Seq length: {MAX_SEQ_LENGTH}")
+    print(f"LoRA: rank={LORA_RANK}, alpha={LORA_ALPHA}, dropout={LORA_DROPOUT}")
+    print(f"Max new tokens: {MAX_NEW_TOKENS}")
+    print(f"Grad accum: {GRADIENT_ACCUMULATION_STEPS} (effective batch: {BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS})")
+
+    # Load data
+    train_ds, eval_ds, text_col, label_col = load_data()
+
+    # Load tokenizer
+    tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "right"
+
+    # Quantization config (4-bit for QLoRA)
+    use_qlora = DEVICE == "cuda"
+    bnb_config = None
+    if use_qlora:
+        try:
+            from bitsandbytes import __version__ as bnb_version
+            bnb_config = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_compute_dtype=torch.bfloat16,
+                bnb_4bit_use_double_quant=True,
+            )
+            print(f"Using QLoRA with bitsandbytes {bnb_version}")
+        except ImportError:
+            print("WARNING: bitsandbytes not available, using standard training")
+            use_qlora = False
+
+    # Load model
+    model_kwargs = {"torch_dtype": torch.float16 if DEVICE == "cuda" else torch.float32}
+    if bnb_config:
+        model_kwargs["quantization_config"] = bnb_config
+        model_kwargs["device_map"] = "auto"
+    else:
+        model_kwargs["device_map"] = None
+
+    model = AutoModelForCausalLM.from_pretrained(BASE_MODEL, **model_kwargs)
+
+    if not bnb_config:
+        model = model.to(DEVICE)
+
+    params_m = count_params_millions(model)
+    print(f"Total parameters: {params_m:.1f}M")
+
+    # Apply LoRA
+    try:
+        from peft import LoraConfig, get_peft_model, TaskType
+
+        lora_config = LoraConfig(
+            r=LORA_RANK,
+            lora_alpha=LORA_ALPHA,
+            lora_dropout=LORA_DROPOUT,
+            bias="none",
+            task_type=TaskType.CAUSAL_LM,
+            target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
+                            "gate_proj", "up_proj", "down_proj"],
+        )
+        model = get_peft_model(model, lora_config)
+        model.enable_input_require_grads()  # Required for gradient checkpointing + QLoRA
+        trainable_m = count_trainable_params_millions(model)
+        print(f"LoRA trainable parameters: {trainable_m:.1f}M ({trainable_m/params_m*100:.1f}%)")
+        model.print_trainable_parameters()
+    except ImportError:
+        print("WARNING: peft not installed, training all parameters (will be slow and memory-intensive)")
+        trainable_m = params_m
+
+    # Format and tokenize data
+    def tokenize_function(examples):
+        """Tokenize instruction-response pairs for causal LM training."""
+        texts = []
+        for i in range(len(examples[text_col])):
+            example = {text_col: examples[text_col][i], label_col: examples[label_col][i]}
+            text = format_for_training(example, text_col, label_col, tokenizer)
+            texts.append(text)
+
+        tokenized = tokenizer(
+            texts,
+            truncation=True,
+            max_length=MAX_SEQ_LENGTH,
+            padding="max_length",
+        )
+        # For causal LM, labels = input_ids (shifted internally by the model)
+        tokenized["labels"] = tokenized["input_ids"].copy()
+        return tokenized
+
+    print("Tokenizing training data...")
+    tokenized_train = train_ds.map(
+        tokenize_function,
+        batched=True,
+        remove_columns=train_ds.column_names,
+    )
+    print("Tokenizing evaluation data...")
+    tokenized_eval = eval_ds.map(
+        tokenize_function,
+        batched=True,
+        remove_columns=eval_ds.column_names,
+    )
+
+    # Training arguments
+    training_args = TrainingArguments(
+        output_dir="./checkpoints",
+        learning_rate=LEARNING_RATE,
+        per_device_train_batch_size=BATCH_SIZE,
+        per_device_eval_batch_size=BATCH_SIZE,
+        num_train_epochs=NUM_EPOCHS,
+        warmup_ratio=WARMUP_RATIO,
+        weight_decay=WEIGHT_DECAY,
+        gradient_accumulation_steps=GRADIENT_ACCUMULATION_STEPS,
+        lr_scheduler_type=LR_SCHEDULER,
+        eval_strategy="epoch",
+        save_strategy="epoch",
+        load_best_model_at_end=True,
+        metric_for_best_model="eval_loss",
+        greater_is_better=False,
+        save_total_limit=2,
+        logging_steps=20,
+        report_to="none",
+        fp16=(DEVICE == "cuda"),
+        gradient_checkpointing=True,
+        gradient_checkpointing_kwargs={"use_reentrant": False},
+        optim="adamw_torch",
+    )
+
+    # Trainer
+    from transformers import Trainer, DataCollatorForLanguageModeling
+
+    data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
+
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        train_dataset=tokenized_train,
+        eval_dataset=tokenized_eval,
+        processing_class=tokenizer,
+        data_collator=data_collator,
+    )
+
+    # Train
+    print(f"\nStarting training... ({remaining_time():.0f}s remaining)")
+    trainer.train()
+
+    # Final evaluation (loss)
+    print(f"\nRunning final evaluation... ({remaining_time():.0f}s remaining)")
+    eval_results = trainer.evaluate()
+    eval_loss = eval_results.get("eval_loss", 999.0)
+
+    # Save model
+    best_model_dir = Path("./best_model")
+    trainer.save_model(str(best_model_dir))
+    tokenizer.save_pretrained(str(best_model_dir))
+    print(f"Model saved to {best_model_dir}")
+
+    # Generation-based evaluation (ROUGE-L + slot accuracy)
+    print(f"\nRunning generation evaluation... ({remaining_time():.0f}s remaining)")
+    rouge_l = 0.0
+    slot_accuracy = 0.0
+
+    if remaining_time() > 120:  # only if we have at least 2 min left
+        model.eval()
+        n_eval = min(50, len(eval_ds))
+        predictions = []
+        references = []
+        inputs = []
+
+        for i in range(n_eval):
+            example = eval_ds[i]
+            input_text = example[text_col]
+            reference_text = example[label_col]
+
+            # Build prompt (input only, no output)
+            if hasattr(tokenizer, "chat_template") and tokenizer.chat_template:
+                messages = [{"role": "user", "content": input_text}]
+                try:
+                    prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+                except Exception:
+                    prompt = f"### Input:\n{input_text}\n\n### Output:\n"
+            else:
+                prompt = f"### Input:\n{input_text}\n\n### Output:\n"
+
+            encoded = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=MAX_SEQ_LENGTH).to(DEVICE)
+
+            with torch.no_grad():
+                outputs = model.generate(
+                    **encoded,
+                    max_new_tokens=MAX_NEW_TOKENS,
+                    do_sample=False,
+                    temperature=1.0,
+                    pad_token_id=tokenizer.pad_token_id,
+                )
+
+            generated = tokenizer.decode(outputs[0][encoded["input_ids"].shape[1]:], skip_special_tokens=True)
+            predictions.append(generated.strip())
+            references.append(reference_text)
+            inputs.append(input_text)
+
+        # Compute metrics
+        rouge_scores = compute_rouge(predictions, references)
+        rouge_l = rouge_scores.get("rouge_l", 0.0)
+        slot_accuracy = compute_slot_accuracy(predictions, references, inputs)
+
+        print(f"ROUGE-L: {rouge_l:.4f}")
+        print(f"Slot accuracy: {slot_accuracy:.4f}")
+    else:
+        print("Skipping generation evaluation (insufficient time)")
+
+    # Model size estimation
+    size_mb = measure_model_size_mb(model)
+
+    # Output results
+    elapsed = time.time() - start_time
+    result = {
+        "model": BASE_MODEL,
+        "rouge_l": round(rouge_l, 4),
+        "slot_accuracy": round(slot_accuracy, 4),
+        "loss": round(eval_loss, 4),
+        "perplexity": round(np.exp(min(eval_loss, 10)), 4),  # cap to avoid overflow
+        "params_M": round(params_m, 1),
+        "trainable_M": round(trainable_m, 1),
+        "size_mb": round(size_mb, 0),
+        "lora_rank": LORA_RANK,
+        "lora_alpha": LORA_ALPHA,
+        "duration_s": elapsed,
+        # Compat fields for results.tsv
+        "f1": round(rouge_l, 4),  # use ROUGE-L as primary metric
+        "precision": round(slot_accuracy, 4),
+        "recall": 0.0,
+        "inference_ms": 0.0,
+    }
+
+    print(f"\n{'='*60}")
+    print(f"RESULT SUMMARY")
+    print(f"{'='*60}")
+    print(f"Model:      {BASE_MODEL} ({params_m:.1f}M total, {trainable_m:.1f}M trainable)")
+    print(f"ROUGE-L:    {rouge_l:.4f}")
+    print(f"Slot Acc:   {slot_accuracy:.4f}")
+    print(f"Loss:       {eval_loss:.4f}")
+    print(f"Perplexity: {result['perplexity']:.2f}")
+    print(f"LoRA:       rank={LORA_RANK}, alpha={LORA_ALPHA}")
+    print(f"Duration:   {elapsed:.0f}s ({elapsed/60:.1f}m)")
+    print(f"{'='*60}")
+
+    Path("last_result.json").write_text(json.dumps(result, indent=2))
+
+    return result
+
+
+if __name__ == "__main__":
+    main()

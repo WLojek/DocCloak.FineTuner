@@ -45,23 +45,34 @@ Progressive phases:
 - [Anthropic API key](https://console.anthropic.com/) (for the `run` command only — `init` and `export` don't need it)
 - GPU recommended (CUDA or Apple MPS) — CPU works but is slow
 
-## Supported Models
+## Supported Tasks
 
-Any model from [HuggingFace Hub](https://huggingface.co/models) compatible with `AutoModelForTokenClassification`. This includes:
+### Token Classification (NER / PII Detection)
 
-- **BERT** variants (bert-base, bert-large, etc.)
-- **RoBERTa** / **XLM-RoBERTa** (multilingual)
-- **HerBERT** (Polish)
-- **DeBERTa** / **DeBERTa-v3**
-- **DistilBERT** (lightweight)
-- **ELECTRA**, **ALBERT**, and more
+Fine-tunes encoder models (BERT-family) on BIO-labeled NER datasets.
+
+**Supported models:** Any `AutoModelForTokenClassification` from HuggingFace — BERT, RoBERTa, XLM-RoBERTa, HerBERT, DeBERTa, DistilBERT, ELECTRA, ALBERT, etc.
+
+**Dataset format:** Text column (list of tokens) + label column (list of BIO tags).
+
+**Metrics:** F1, precision, recall.
+
+### Text Generation (Scribe / Document Generation)
+
+Fine-tunes decoder models (LLaMA-family) with QLoRA for template-filling document generation.
+
+**Supported models:** Any `AutoModelForCausalLM` from HuggingFace — LLaMA, Mistral, etc.
+
+**Dataset format:** Input column (template + user request) + output column (filled document).
+
+**Metrics:** ROUGE-L, slot accuracy, perplexity.
+
+**Extra dependencies:** `pip install -e ".[qlora]"` (peft, bitsandbytes, trl, rouge-score).
 
 ## Supported Datasets
 
-- **Local datasets** — HuggingFace `datasets` format on disk (e.g. `./datasets/polish-pii`)
-- **HuggingFace Hub** — any NER dataset by ID (e.g. `ai4privacy/open-pii-masking-500k`)
-
-Datasets must have a text column (list of tokens) and a label column (list of BIO tags).
+- **Local datasets** — HuggingFace `datasets` format on disk (e.g. `./datasets/polish-pii`, `./datasets/scribe-no`)
+- **HuggingFace Hub** — any dataset by ID (e.g. `ai4privacy/open-pii-masking-500k`)
 
 ## Installation
 
@@ -124,7 +135,34 @@ max_runs: 20
 max_no_improvement: 4
 ```
 
-See `config.herbert.yaml` for a complete example.
+See `config.herbert.yaml` for a complete NER example and `config.scribe.yaml` for text generation.
+
+### Scribe (Text Generation) Config
+
+```yaml
+base_models:
+  - NbAiLab/nb-llama-3.2-1B
+
+dataset: ./datasets/scribe-no
+task: text-generation
+text_column: input
+label_column: output
+eval_split: validation
+
+agent_model: claude-sonnet-4-6
+metric: rouge_l
+metric_goal: maximize
+sweep_epochs: 1
+time_budget_per_run: 4h
+max_runs: 25
+max_no_improvement: 5
+
+# QLoRA hyperparameters
+lora_rank: 16
+lora_alpha: 32
+lora_dropout: 0.05
+max_new_tokens: 1024
+```
 
 ### 4. Initialize workspace
 
@@ -144,65 +182,115 @@ The orchestrator will systematically test models and hyperparameters, logging re
 
 ### 6. Export the trained model
 
-After training, export the best model for deployment:
+After training, export the best model for deployment.
+
+#### Token Classification (NER) Export
 
 ```bash
 # PyTorch format (default)
 doccloak-finetune export -i workspace/best_model -o export --pytorch
 
-# ONNX format (for cross-platform deployment)
+# ONNX format (for browser / cross-platform)
 doccloak-finetune export -i workspace/best_model -o export --onnx
 
-# ONNX with INT8 dynamic quantization (for browser / edge)
+# ONNX + INT8 dynamic quantization (~75% smaller, no GPU needed)
 doccloak-finetune export -i workspace/best_model -o export --onnx --int8 dynamic
 
-# ONNX with INT8 static quantization (more accurate, needs calibration data)
+# ONNX + INT8 static quantization (best accuracy, needs calibration data)
 doccloak-finetune export -i workspace/best_model -o export --onnx --int8 static --calibration-data datasets/polish-pii
 
-# All formats at once
+# Multiple formats at once
 doccloak-finetune export -i workspace/best_model -o export --pytorch --onnx --int8 dynamic
 ```
 
-For ONNX export, install the optional dependencies:
+#### Text Generation (Scribe) Export
+
+For Scribe models, the export automatically detects and merges LoRA adapters into the base model.
 
 ```bash
-pip install -e ".[onnx]"
+# PyTorch (merged model, ~5GB)
+doccloak-finetune export -i workspace_scribe/best_model -o export_scribe --pytorch
+
+# ONNX + INT8 quantization (~1.4GB, no GPU needed)
+doccloak-finetune export -i workspace_scribe/best_model -o export_scribe --onnx
+
+# GPTQ INT4 quantization (~500MB, REQUIRES GPU — run on RunPod)
+doccloak-finetune export -i workspace_scribe/best_model -o export_scribe --gptq
+
+# Force task type if auto-detection fails
+doccloak-finetune export -i workspace_scribe/best_model -o export_scribe --gptq --task text-generation
 ```
 
-### Export output
+#### Export Format Comparison
+
+| Format | Size (1B model) | Quality loss | GPU required | Best for |
+|--------|-----------------|-------------|-------------|----------|
+| PyTorch (safetensors) | ~5 GB | None | No | Server deployment, further conversion |
+| ONNX FP32 | ~5.7 GB | None | No | Cross-platform inference |
+| ONNX INT8 | ~1.4 GB | <1% | No | Browser (acceptable size) |
+| **GPTQ INT4** | **~500 MB** | **<1%** | **Yes** | **Browser (recommended)** |
+
+**For browser deployment, use GPTQ INT4.** It produces the smallest model with negligible quality loss. Run it on RunPod (~$0.10 for 10 minutes).
+
+#### Dependencies
+
+```bash
+# ONNX export only
+pip install -e ".[onnx]"
+
+# QLoRA training + GPTQ export + ONNX (everything)
+pip install -e ".[qlora,onnx]"
+```
+
+On GPU cloud (RunPod), `setup_gpu.sh` installs all dependencies automatically.
+
+#### Export Output Structure
 
 ```
 export/
-├── onnx/
-│   ├── model.onnx              # Full FP32 ONNX model (~473 MB)
-│   ├── model_quantized.onnx    # INT8 quantized model (~119 MB, 75% smaller)
-│   ├── config.json             # Model config (label map, architecture)
-│   ├── tokenizer.json          # Tokenizer data
-│   ├── tokenizer_config.json   # Tokenizer config
-│   └── export_metadata.json    # Export info (format, quantization, sizes)
-└── pytorch/                    # Only if --pytorch flag used
-    ├── model.safetensors
-    ├── config.json
-    └── tokenizer files...
+├── pytorch/                    # --pytorch
+│   ├── model.safetensors
+│   ├── config.json
+│   └── tokenizer files...
+├── onnx/                       # --onnx
+│   ├── model.onnx
+│   ├── model.onnx_data         # External weights (large models)
+│   └── config + tokenizer...
+├── onnx_quantized/             # --onnx --int8
+│   ├── model_quantized.onnx
+│   └── config + tokenizer...
+├── gptq_int4/                  # --gptq (requires GPU)
+│   ├── model.safetensors       # ~500MB quantized weights
+│   ├── config.json
+│   ├── quantize_config.json    # GPTQ parameters
+│   └── tokenizer files...
+├── merged/                     # Auto-created when merging LoRA
+│   └── (full merged model)
+└── export_metadata.json        # Export info
 ```
-
-The quantized ONNX model is ready for browser deployment (via ONNX Runtime WebAssembly) or any cross-platform runtime.
 
 ## GPU Cloud Deployment (RunPod)
 
 ### 1. Create a pod
 
-- GPU: RTX 4090 (24 GB VRAM) or similar
+- GPU: RTX 4090 (24 GB VRAM) — sufficient for 1B models with QLoRA
 - Container disk: 20 GB
-- Volume disk: 50 GB
-- Enable SSH terminal access
+- Volume disk: 50 GB (workspace persists across restarts)
+- Use "SSH over exposed TCP" for SCP file transfers (regular SSH doesn't support SCP)
 
 ### 2. Upload and setup
 
-From your local machine:
+From your local machine (use the TCP port from RunPod UI):
 
 ```bash
-scp -P <PORT> -i ~/.ssh/id_ed25519 -r DocCloak.FineTuner root@<HOST>:/workspace/
+# Copy FineTuner code
+scp -P <PORT> -i ~/.ssh/id_ed25519 -r DocCloak.FineTuner root@<HOST>:/workspace/DocCloak.FineTuner
+
+# Copy dataset (for Scribe)
+scp -P <PORT> -i ~/.ssh/id_ed25519 -r DocCloak.DataForge/output_scribe/legal-hr/no/hf_scribe_dataset root@<HOST>:/workspace/DocCloak.FineTuner/datasets/scribe-no
+
+# SSH in
+ssh root@<HOST> -p <PORT> -i ~/.ssh/id_ed25519
 ```
 
 On the pod:
@@ -212,17 +300,90 @@ cd /workspace/DocCloak.FineTuner
 bash setup_gpu.sh
 source .venv/bin/activate
 echo "ANTHROPIC_API_KEY=your-key" > .env
-doccloak-finetune init -c config.herbert.yaml -o workspace_herbert
-doccloak-finetune run -c config.herbert.yaml -o workspace_herbert
 ```
 
-### 3. Download results
+### 3. Run training
+
+```bash
+# NER (token classification)
+doccloak-finetune run -c config.herbert.yaml -o workspace_herbert
+
+# Scribe (text generation)
+doccloak-finetune run -c config.scribe.yaml -o workspace_scribe
+```
+
+Use `tmux` to keep it running after disconnecting:
+
+```bash
+tmux new -s training
+doccloak-finetune run -c config.scribe.yaml -o workspace_scribe
+# Detach: Ctrl+B then D
+# Reconnect later: tmux attach -t training
+```
+
+### 4. Export and download
+
+```bash
+# GPTQ INT4 — smallest model for browser (~500MB, recommended)
+doccloak-finetune export -i workspace_scribe/best_model -o export_scribe --gptq
+
+# Or ONNX INT8 (~1.4GB, no GPTQ dependency needed)
+export TMPDIR=/workspace/tmp && mkdir -p /workspace/tmp
+doccloak-finetune export -i workspace_scribe/best_model -o export_scribe --onnx
+
+# Or PyTorch only (for further conversion later)
+doccloak-finetune export -i workspace_scribe/best_model -o export_scribe --pytorch
+```
 
 From your local machine:
 
 ```bash
-scp -P <PORT> -i ~/.ssh/id_ed25519 -r root@<HOST>:/workspace/DocCloak.FineTuner/workspace_herbert/best_model ./best_model
+# Download GPTQ model (~500MB)
+scp -P <PORT> -i ~/.ssh/id_ed25519 -r root@<HOST>:/workspace/DocCloak.FineTuner/export_scribe/gptq_int4 ./export_scribe/gptq_int4
+
+# Or download everything
+scp -P <PORT> -i ~/.ssh/id_ed25519 -r root@<HOST>:/workspace/DocCloak.FineTuner/export_scribe ./export_scribe
 ```
+
+Then stop the pod to save money.
+
+### Quick GPTQ-only export (if model is already trained)
+
+If you already have a merged model and just need GPTQ quantization:
+
+```bash
+# From local machine — copy merged model to RunPod
+ssh root@<HOST> -p <PORT> -i ~/.ssh/id_ed25519 "mkdir -p /workspace/export_scribe"
+scp -P <PORT> -i ~/.ssh/id_ed25519 -r export_scribe/merged root@<HOST>:/workspace/export_scribe/merged
+
+# SSH in and run GPTQ
+ssh root@<HOST> -p <PORT> -i ~/.ssh/id_ed25519
+cd /workspace/DocCloak.FineTuner
+source .venv/bin/activate
+doccloak-finetune export -i /workspace/export_scribe/merged -o /workspace/export_scribe --gptq
+
+# Download result (~500MB, ~2 min)
+# From local: scp -P <PORT> -i ~/.ssh/id_ed25519 -r root@<HOST>:/workspace/export_scribe/gptq_int4 ./export_scribe/gptq_int4
+```
+
+This takes ~10 minutes on an RTX 4090 and costs ~$0.10.
+
+### Troubleshooting (RunPod)
+
+| Problem | Solution |
+|---------|----------|
+| `OSError: No space left on device` during ONNX export | Set `export TMPDIR=/workspace/tmp && mkdir -p /workspace/tmp` — the container `/tmp` is only 20GB, use the workspace volume instead |
+| `README.md not found` during `pip install -e .` | Run `touch README.md` — SCP may skip hidden/dotfiles |
+| `RuntimeError: element 0 of tensors does not require grad` | Template fix needed: `model.enable_input_require_grads()` must be called after `get_peft_model()` for QLoRA + gradient checkpointing |
+| Nested directory after SCP (`DocCloak.FineTuner/DocCloak.FineTuner/`) | Flatten: `mv DocCloak.FineTuner/DocCloak.FineTuner/* DocCloak.FineTuner/ && rm -rf DocCloak.FineTuner/DocCloak.FineTuner` |
+| `datasets/` empty after SCP | Re-copy: `scp -P <PORT> -i ~/.ssh/id_ed25519 -r <dataset_path> root@<HOST>:/workspace/DocCloak.FineTuner/datasets/scribe-no` |
+| Training killed after SSH disconnect | Use `tmux` (see step 3 above) |
+| `top_p` warnings during generation eval | Harmless — the model ignores unsupported generation flags |
+| Tied weights warning during ONNX export | Harmless — embedding/output weight sharing is normal for LLMs |
+| `RuntimeError: GPTQ requires CUDA GPU` | GPTQ must run on a GPU machine. Use RunPod or similar. Cannot run on CPU/Mac |
+| `CUDA initialization: NVIDIA driver too old` | The system torch has wrong CUDA version. Run `bash setup_gpu.sh` which installs correct torch for your GPU |
+| `Failed to serialize proto` during ONNX export | Model too large for protobuf. Use `--no-post-process` (handled automatically in our exporter) or use `--gptq` instead |
+| ONNX INT4 larger than INT8 | Normal — ONNX Runtime's naive INT4 only quantizes MatMul weights. Use `--gptq` for proper INT4 (~500MB) |
 
 ## CLI Reference
 
@@ -234,13 +395,16 @@ scp -P <PORT> -i ~/.ssh/id_ed25519 -r root@<HOST>:/workspace/DocCloak.FineTuner/
 
 ### Export flags
 
-| Flag | Description |
-|------|-------------|
-| `--pytorch` | Export as PyTorch model |
-| `--onnx` | Export as ONNX model |
-| `--int8 dynamic` | Apply INT8 dynamic quantization (no calibration needed) |
-| `--int8 static` | Apply INT8 static quantization (requires `--calibration-data`) |
-| `--calibration-data PATH` | Dataset for static quantization calibration |
+| Flag | Description | Requires |
+|------|-------------|----------|
+| `--pytorch` | Export as PyTorch safetensors | Nothing |
+| `--onnx` | Export as ONNX model | `pip install -e ".[onnx]"` |
+| `--gptq` | GPTQ INT4 quantization (~500MB, best for browser) | GPU + `pip install -e ".[qlora]"` |
+| `--int8 dynamic` | ONNX INT8 dynamic quantization | `--onnx` |
+| `--int8 static` | ONNX INT8 static quantization | `--onnx` + `--calibration-data` |
+| `--int4` | ONNX INT4 quantization (naive, less effective than GPTQ) | `--onnx` |
+| `--task TYPE` | Force task type: `token-classification`, `text-generation`, `auto` | Nothing |
+| `--calibration-data PATH` | Dataset for static INT8 calibration | `--int8 static` |
 
 ## Constraint Enforcement
 
@@ -266,43 +430,62 @@ scp -P <PORT> -i ~/.ssh/id_ed25519 -r root@<HOST>:/workspace/DocCloak.FineTuner/
 
 ## Config Reference
 
+### Token Classification (NER)
+
 ```yaml
-# Models to compare (agent sweeps all, then deep-tunes the best)
 base_models:
   - xlm-roberta-base
-  - bert-base-multilingual-cased
+  - allegro/herbert-base-cased
 
-# Or single model
-# base_model: xlm-roberta-base
-
-# Dataset (local path or HuggingFace Hub ID)
-dataset: ./datasets/my-ner-data
+dataset: ./datasets/polish-pii      # Local path or HuggingFace Hub ID
 task: token-classification
-text_column: tokens
-label_column: ner_tags
+text_column: tokens                  # Column with list of word tokens
+label_column: ner_tags               # Column with list of BIO tags
 eval_split: validation
-dataset_config: null
-max_samples: null
-languages: []
+dataset_config: null                 # HuggingFace dataset config name
+max_samples: null                    # Limit dataset size (for quick tests)
+languages: []                        # Filter by language column (if dataset has one)
 
-# Agent model (cost vs quality)
-agent_model: claude-sonnet-4-6   # ~$5-8/run | claude-opus-4-6 ~$15-20/run
-
-# Optimization
-metric: f1
+agent_model: claude-sonnet-4-6       # Agent that drives the research loop
+metric: f1                           # Primary metric to optimize
 metric_goal: maximize
-sweep_epochs: 2                  # Quick epochs for Phase 0 model sweep
-time_budget_per_run: 20m         # Per-experiment time limit
+sweep_epochs: 3                      # Quick epochs for Phase 0 model sweep
+time_budget_per_run: 10h             # Max time per experiment
+device: auto                         # cuda, mps, cpu, or auto
+
+max_model_size_mb: null              # Reject models exceeding this size
+max_inference_ms: null               # Reject models slower than this
+max_runs: 25                         # Hard limit on experiments
+max_no_improvement: 6                # Stop after N runs with no improvement
+target_metric: null                  # Stop when metric reaches this value
+```
+
+### Text Generation (Scribe)
+
+```yaml
+base_models:
+  - NbAiLab/nb-llama-3.2-1B
+
+dataset: ./datasets/scribe-no       # HuggingFace Dataset with input/output columns
+task: text-generation
+text_column: input                   # Column with template + user request
+label_column: output                 # Column with filled document
+eval_split: validation
+
+agent_model: claude-sonnet-4-6
+metric: rouge_l                      # Primary metric (ROUGE-L for generation quality)
+metric_goal: maximize
+sweep_epochs: 1                      # 1 epoch per experiment (fast iteration)
+time_budget_per_run: 4h
 device: auto
-
-# Deployment constraints (optional)
-max_model_size_mb: null
-max_inference_ms: null
-
-# Safeguards
 max_runs: 25
-max_no_improvement: 6
-target_metric: null
+max_no_improvement: 5
+
+# QLoRA hyperparameters (text-generation only, ignored for token-classification)
+lora_rank: 16                        # LoRA adapter rank (4-64)
+lora_alpha: 32                       # LoRA scaling factor (usually 2x rank)
+lora_dropout: 0.05                   # LoRA dropout (0.0-0.3)
+max_new_tokens: 1024                 # Max tokens to generate during evaluation
 ```
 
 ## Project Structure
@@ -313,18 +496,22 @@ DocCloak.FineTuner/
 │   ├── cli.py                 # CLI: init, run, export commands
 │   ├── config.py              # Config dataclass + YAML parsing
 │   ├── orchestrator.py        # API-driven research loop
-│   ├── exporter.py            # ONNX export + INT8 quantization
+│   ├── exporter.py            # ONNX export + INT8 quantization (token classification)
+│   ├── exporter_causal.py     # ONNX export + LoRA merge + INT4 (text generation)
 │   ├── tools.py               # Tool definitions + validation
 │   └── scaffold/
 │       ├── generator.py       # Renders templates into workspace
 │       └── templates/
 │           ├── token_classification_train.py.j2
 │           ├── token_classification_prepare.py.j2
+│           ├── text_generation_train.py.j2
+│           ├── text_generation_prepare.py.j2
 │           └── guard.py.j2
 ├── tests/
 │   ├── test_cli.py            # Workspace generation tests
 │   └── test_config.py         # Config parsing tests
-├── config.herbert.yaml        # Example config for Polish PII
+├── config.herbert.yaml        # Example config for Polish PII (token classification)
+├── config.scribe.yaml         # Example config for Scribe (text generation)
 ├── setup_gpu.sh               # GPU cloud setup script
 ├── .env.example               # API key template
 ├── pyproject.toml             # Package config + dependencies

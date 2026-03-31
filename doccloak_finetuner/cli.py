@@ -88,11 +88,14 @@ def run(config, output):
 @main.command()
 @click.option("--input", "-i", required=True, type=click.Path(exists=True), help="Path to trained model (e.g. workspace/best_model)")
 @click.option("--output", "-o", required=True, type=click.Path(), help="Output directory")
+@click.option("--task", type=click.Choice(["token-classification", "text-generation", "auto"]), default="auto", help="Model task type (auto-detects from model config)")
 @click.option("--pytorch", is_flag=True, help="Export as PyTorch model")
 @click.option("--onnx", is_flag=True, help="Export as ONNX model")
+@click.option("--gptq", is_flag=True, help="Export with GPTQ INT4 quantization (requires GPU, text-generation only)")
 @click.option("--int8", "int8_mode", type=click.Choice(["dynamic", "static"]), default=None, help="Apply INT8 quantization: dynamic (no calibration) or static (uses eval data)")
+@click.option("--int4", is_flag=True, help="Apply INT4 quantization (text-generation only)")
 @click.option("--calibration-data", type=click.Path(exists=True), default=None, help="Dataset path for static INT8 calibration (required with --int8 static)")
-def export(input, output, pytorch, onnx, int8_mode, calibration_data):
+def export(input, output, task, pytorch, onnx, gptq, int8_mode, int4, calibration_data):
     """Export trained model to specified format with optional quantization.
 
     Examples:
@@ -103,29 +106,47 @@ def export(input, output, pytorch, onnx, int8_mode, calibration_data):
 
       doccloak-finetune export -i best_model -o export --onnx --int8 dynamic
 
-      doccloak-finetune export -i best_model -o export --onnx --int8 static --calibration-data datasets/polish-pii
+      doccloak-finetune export -i best_model -o export --onnx --int4 --task text-generation
 
       doccloak-finetune export -i best_model -o export --pytorch --onnx --int8 dynamic
     """
-    from .exporter import export_pytorch, export_onnx, validate_onnx, _validate_model_dir
-
     model_dir = Path(input)
     output_dir = Path(output)
 
+    # Auto-detect task type
+    if task == "auto":
+        # Check if it's a LoRA/causal model
+        adapter_config = model_dir / "adapter_config.json"
+        if adapter_config.exists():
+            task = "text-generation"
+        else:
+            import json
+            config_path = model_dir / "config.json"
+            if config_path.exists():
+                model_config = json.loads(config_path.read_text())
+                architectures = model_config.get("architectures", [])
+                if any("CausalLM" in a for a in architectures):
+                    task = "text-generation"
+                else:
+                    task = "token-classification"
+            else:
+                task = "token-classification"
+        click.echo(f"Auto-detected task: {task}")
+
     # Default to pytorch if nothing specified
-    if not pytorch and not onnx:
+    if not pytorch and not onnx and not gptq:
         pytorch = True
 
     if int8_mode and not onnx:
         raise click.ClickException("--int8 requires --onnx")
 
+    if int4 and not onnx:
+        raise click.ClickException("--int4 requires --onnx")
+
     if int8_mode == "static" and not calibration_data:
         raise click.ClickException("--int8 static requires --calibration-data")
 
-    _validate_model_dir(model_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-
-    quantize = int8_mode or "none"
 
     click.echo(f"Exporting model from {model_dir}")
     flags = []
@@ -133,19 +154,39 @@ def export(input, output, pytorch, onnx, int8_mode, calibration_data):
         flags.append("PyTorch")
     if onnx:
         flags.append("ONNX")
+    if gptq:
+        flags.append("GPTQ INT4")
     if int8_mode:
-        flags.append(f"INT8 {int8_mode} quantization")
+        flags.append(f"INT8 {int8_mode}")
+    if int4:
+        flags.append("INT4")
+    click.echo(f"  Task: {task}")
     click.echo(f"  Formats: {', '.join(flags)}")
     click.echo()
 
-    if pytorch:
-        export_pytorch(model_dir, output_dir)
+    if task == "text-generation":
+        from .exporter_causal import export_causal_model
+        export_causal_model(
+            model_dir=model_dir,
+            output_dir=output_dir,
+            do_onnx=onnx,
+            do_int4=int4,
+            do_gptq=gptq,
+            do_pytorch=pytorch,
+        )
+    else:
+        from .exporter import export_pytorch, export_onnx, validate_onnx, _validate_model_dir
+        _validate_model_dir(model_dir)
+        quantize = int8_mode or "none"
 
-    if onnx:
-        cal_path = Path(calibration_data) if calibration_data else None
-        onnx_dir = export_onnx(model_dir, output_dir, quantize=quantize, calibration_data=cal_path)
-        click.echo()
-        validate_onnx(onnx_dir)
+        if pytorch:
+            export_pytorch(model_dir, output_dir)
+
+        if onnx:
+            cal_path = Path(calibration_data) if calibration_data else None
+            onnx_dir = export_onnx(model_dir, output_dir, quantize=quantize, calibration_data=cal_path)
+            click.echo()
+            validate_onnx(onnx_dir)
 
     click.echo()
     click.echo("Export complete!")

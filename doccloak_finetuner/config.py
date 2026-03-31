@@ -38,6 +38,12 @@ class FineTuneConfig:
     target_metric: float | None = None
     max_no_improvement: int = 8
 
+    # QLoRA / text-generation specific
+    lora_rank: int = 16
+    lora_alpha: int = 32
+    lora_dropout: float = 0.05
+    max_new_tokens: int = 1024
+
     @property
     def candidate_models(self) -> list[str]:
         """Ordered list of models to try. Falls back to base_model if base_models is empty."""

@@ -4,15 +4,14 @@ build-backend = "hatchling.build"
 
 [project]
 name = "doccloak-finetuner"
-version = "0.1.0"
-description = "API-driven autonomous fine-tuning for DocCloak PII detection models."
-readme = "README.md"
+version = "0.2.0"
+description = "API-driven autonomous fine-tuning for DocCloak models — NER/PII detection and document generation."
 license = "AGPL-3.0-only"
 requires-python = ">=3.11"
 authors = [
     { name = "DocCloak Team" },
 ]
-keywords = ["fine-tuning", "ner", "pii", "claude-api", "doccloak"]
+keywords = ["fine-tuning", "ner", "pii", "text-generation", "qlora", "gptq", "claude-api", "doccloak"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
@@ -30,8 +29,8 @@ dependencies = [
     "torch>=2.6,<3",
     "torchvision>=0.21,<1",
     "torchaudio>=2.6,<3",
-    "transformers>=4.46,<5",
-    "datasets>=2.0,<4",
+    "transformers>=4.44,<5",
+    "datasets>=2.0",
     "seqeval>=1.2,<2",
     "accelerate>=0.20,<2",
     "numpy<3",
@@ -42,6 +41,15 @@ onnx = [
     "onnx>=1.15,<2",
     "onnxruntime>=1.18,<2",
     "optimum[onnxruntime]>=1.20,<2",
+]
+qlora = [
+    "peft>=0.12",
+    "bitsandbytes>=0.43",
+    "trl>=1.0",
+    "rouge-score>=0.1",
+]
+gptq = [
+    "auto-gptq>=0.7",
 ]
 dev = [
     "pytest>=8.0",

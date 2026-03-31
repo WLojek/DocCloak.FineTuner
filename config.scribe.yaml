@@ -1,0 +1,26 @@
+base_models:
+  - NbAiLab/nb-llama-3.2-1B
+
+dataset: ./datasets/scribe-no
+task: text-generation
+
+text_column: input
+label_column: output
+eval_split: validation
+
+agent_model: claude-sonnet-4-6
+metric: rouge_l
+metric_goal: maximize
+
+sweep_epochs: 1
+time_budget_per_run: 4h
+device: auto
+
+max_runs: 25
+max_no_improvement: 5
+
+# QLoRA defaults
+lora_rank: 16
+lora_alpha: 32
+lora_dropout: 0.05
+max_new_tokens: 1024

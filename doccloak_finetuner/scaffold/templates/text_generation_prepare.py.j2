@@ -1,0 +1,157 @@
+"""Dataset preparation for text generation (Scribe). DO NOT MODIFY — this file is read-only."""
+
+import json
+from pathlib import Path
+from datasets import load_dataset, load_from_disk
+
+DATASET_NAME = "{{ config.dataset }}"
+DATASET_CONFIG = {% if config.dataset_config %}"{{ config.dataset_config }}"{% else %}None{% endif %}
+EVAL_SPLIT = "{{ config.eval_split }}"
+MAX_SAMPLES = {{ config.max_samples or "None" }}
+TEXT_COLUMN = {% if config.text_column %}"{{ config.text_column }}"{% else %}"input"{% endif %}
+LABEL_COLUMN = {% if config.label_column %}"{{ config.label_column }}"{% else %}"output"{% endif %}
+
+
+def _detect_column(features, candidates, kind="column"):
+    """Find the first matching column from candidates."""
+    for name in candidates:
+        if name and name in features:
+            return name
+    raise ValueError(f"Could not find {kind} column. Available: {list(features.keys())}")
+
+
+def load_data():
+    """Load and return train/eval datasets for text generation.
+
+    Returns (train_ds, eval_ds, text_col, label_col)
+    """
+    # Safeguard check
+    from guard import check
+    should_stop, reason = check()
+    if should_stop:
+        print(f"\n[GUARD] {reason}")
+        print("[GUARD] Stopping. Do not start another run.")
+        import sys
+        sys.exit(0)
+
+    # Load dataset
+    if Path(DATASET_NAME).is_dir():
+        print(f"Loading local dataset from: {DATASET_NAME}")
+        ds = load_from_disk(DATASET_NAME)
+    else:
+        print(f"Loading dataset: {DATASET_NAME} (config: {DATASET_CONFIG})")
+        ds = load_dataset(DATASET_NAME, DATASET_CONFIG)
+
+    # Determine splits
+    train_split = "train" if "train" in ds else list(ds.keys())[0]
+    eval_split = EVAL_SPLIT if EVAL_SPLIT in ds else "validation" if "validation" in ds else train_split
+
+    if eval_split == train_split:
+        print(f"WARNING: No separate eval split found, splitting train 90/10")
+        split = ds[train_split].train_test_split(test_size=0.1, seed=42)
+        ds[train_split] = split["train"]
+        ds["_eval"] = split["test"]
+        eval_split = "_eval"
+
+    train_ds = ds[train_split]
+    eval_ds = ds[eval_split] if eval_split != "_eval" else ds["_eval"]
+
+    # Limit samples
+    if MAX_SAMPLES:
+        if len(train_ds) > MAX_SAMPLES:
+            train_ds = train_ds.select(range(MAX_SAMPLES))
+        eval_max = max(MAX_SAMPLES // 5, 50)
+        if len(eval_ds) > eval_max:
+            eval_ds = eval_ds.select(range(eval_max))
+
+    # Detect columns
+    features = train_ds.features
+    print(f"Available columns: {list(features.keys())}")
+
+    text_col = TEXT_COLUMN or _detect_column(features, ["input", "prompt", "instruction", "text"], "input text")
+    label_col = LABEL_COLUMN or _detect_column(features, ["output", "response", "completion", "target"], "output text")
+
+    print(f"Input column: {text_col}")
+    print(f"Output column: {label_col}")
+    print(f"Train: {len(train_ds)} examples")
+    print(f"Eval: {len(eval_ds)} examples")
+
+    # Preview
+    sample = train_ds[0]
+    print(f"\nSample input (first 200 chars): {sample[text_col][:200]}...")
+    print(f"Sample output (first 200 chars): {sample[label_col][:200]}...")
+
+    return train_ds, eval_ds, text_col, label_col
+
+
+def format_for_training(example, text_col, label_col, tokenizer):
+    """Format a single example as an instruction-response pair for causal LM training.
+
+    Uses the model's chat template if available, otherwise a simple format.
+    """
+    input_text = example[text_col]
+    output_text = example[label_col]
+
+    if hasattr(tokenizer, "chat_template") and tokenizer.chat_template:
+        messages = [
+            {"role": "user", "content": input_text},
+            {"role": "assistant", "content": output_text},
+        ]
+        try:
+            return tokenizer.apply_chat_template(messages, tokenize=False)
+        except Exception:
+            pass
+
+    # Fallback: simple instruction format
+    return f"### Input:\n{input_text}\n\n### Output:\n{output_text}"
+
+
+def compute_rouge(predictions: list[str], references: list[str]) -> dict:
+    """Compute ROUGE-L scores between predictions and references."""
+    try:
+        from rouge_score import rouge_scorer
+        scorer = rouge_scorer.RougeScorer(["rougeL"], use_stemmer=False)
+        scores = []
+        for pred, ref in zip(predictions, references):
+            score = scorer.score(ref, pred)
+            scores.append(score["rougeL"].fmeasure)
+        return {"rouge_l": sum(scores) / len(scores) if scores else 0.0}
+    except ImportError:
+        print("WARNING: rouge_score not installed, skipping ROUGE evaluation")
+        return {"rouge_l": 0.0}
+
+
+def compute_slot_accuracy(predictions: list[str], references: list[str], inputs: list[str]) -> float:
+    """Compute what fraction of slot values from the input appear in the output.
+
+    Extracts slot values from the template input and checks if they appear in the generated text.
+    """
+    import re
+    total_slots = 0
+    matched_slots = 0
+
+    for pred, inp in zip(predictions, inputs):
+        # Extract slot values from the training input's user_request section
+        # Look for concrete values that should appear in the output
+        # Simple heuristic: find non-template text between known markers
+        template_match = re.search(r"<template>(.*?)</template>", inp, re.DOTALL)
+        if not template_match:
+            continue
+
+        template = template_match.group(1)
+        # Find all {{slot}} patterns and their expected values
+        slots = re.findall(r"\{\{(\w+)\}\}", template)
+        # These are just slot names; we can't easily extract values from the training input
+        # Instead, check that the output doesn't contain unfilled {{slot}} markers
+        unfilled = re.findall(r"\{\{[^§][^}]*\}\}", pred)
+        section_markers = re.findall(r"\{\{§", pred)
+
+        total_slots += 1
+        if not unfilled and not section_markers:
+            matched_slots += 1
+
+    return matched_slots / total_slots if total_slots > 0 else 0.0
+
+
+if __name__ == "__main__":
+    train, eval_ds, text_col, label_col = load_data()

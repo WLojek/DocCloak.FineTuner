@@ -22,6 +22,7 @@ def generate_experiment(config: FineTuneConfig, output_dir: Path) -> None:
         "token-classification": "token_classification",
         "text-classification": "text_classification",
         "seq2seq": "seq2seq",
+        "text-generation": "text_generation",
     }
 
     task_key = template_map.get(config.task)
@@ -46,8 +47,15 @@ def generate_experiment(config: FineTuneConfig, output_dir: Path) -> None:
     # Initialize results.tsv
     results_path = output_dir / "results.tsv"
     if not results_path.exists():
-        results_path.write_text(
-            "run\ttag\tphase\tmodel\tf1\tprecision\trecall\t"
-            "loss\tparams_M\tsize_mb\tinference_ms\tvalue\t"
-            "duration_s\tnotes\n"
-        )
+        if config.task == "text-generation":
+            results_path.write_text(
+                "run\ttag\tphase\tmodel\trouge_l\tslot_accuracy\tloss\t"
+                "perplexity\tparams_M\tsize_mb\tlora_rank\tvalue\t"
+                "duration_s\tnotes\n"
+            )
+        else:
+            results_path.write_text(
+                "run\ttag\tphase\tmodel\tf1\tprecision\trecall\t"
+                "loss\tparams_M\tsize_mb\tinference_ms\tvalue\t"
+                "duration_s\tnotes\n"
+            )

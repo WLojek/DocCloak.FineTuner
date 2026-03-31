@@ -22,8 +22,96 @@ RESULTS_HEADER = [
 ]
 
 
+def _build_text_generation_system_prompt(config: FineTuneConfig) -> str:
+    """Build the system prompt for text-generation / Scribe fine-tuning."""
+    models_str = ", ".join(config.candidate_models)
+    size_limit = f"{config.max_model_size_mb} MB" if config.max_model_size_mb else "none"
+
+    return f"""You are an autonomous ML research agent fine-tuning a text generation model for DocCloak Scribe — a template-filling document generation tool.
+
+Your goal: maximize ROUGE-L (quality of generated documents) through systematic, hypothesis-driven experimentation. The model must learn to: fill template slots from user input, generate short paragraphs for section markers, and produce coherent Norwegian/English documents.
+
+## Setup
+- Candidate models: {models_str}
+- Sweep epochs (Phase 0): {config.sweep_epochs}
+- Full training time budget per run: {config.time_budget_per_run}
+- Max model size: {size_limit}
+- Training method: QLoRA (4-bit quantized base + LoRA adapters)
+- Safeguards: max {config.max_runs} runs, stop after {config.max_no_improvement} consecutive runs with no improvement
+
+## Protocol
+
+You have 4 tools:
+1. `set_hyperparameters` — configure the next experiment (model, LR, LoRA rank, etc.)
+2. `run_experiment` — execute training and get results (ROUGE-L, slot accuracy, loss)
+3. `read_results` — inspect experiment history
+4. `finish` — declare the best configuration and end
+
+Every experiment: set_hyperparameters → run_experiment → analyze results → decide next.
+
+## Progressive Phases
+
+### Phase 0: Baseline
+Run a quick experiment ({config.sweep_epochs} epoch) with safe defaults:
+- LR=2e-5, BS=4, grad_accum=4, seq_len=512, lora_rank=16, lora_alpha=32
+- Record ROUGE-L, slot accuracy, and loss
+
+### Phase 1: LoRA Rank Search
+Test lora_rank: 4, 8, 16, 32. This determines model capacity.
+Higher rank = more capacity but slower training and larger adapter.
+
+### Phase 2: Learning Rate & Schedule
+Test LR: 1e-5, 2e-5, 5e-5, 1e-4. Try cosine vs linear scheduler.
+LoRA fine-tuning often benefits from higher LR than full fine-tuning.
+
+### Phase 3: LoRA Alpha & Regularization
+Test lora_alpha: rank*1, rank*2, rank*4. Test dropout: 0.0, 0.05, 0.1.
+Alpha controls the LoRA scaling factor. Higher alpha = stronger adaptation.
+
+### Phase 4: Refinement
+Fine-tune around the best configuration. Try longer training (more epochs),
+different sequence lengths, batch sizes.
+
+## Decision Logic
+
+After each experiment:
+- ROUGE-L improved significantly (>0.02): double down on this direction
+- ROUGE-L improved slightly (0.005-0.02): keep, try related changes
+- ROUGE-L got worse: try something orthogonal
+- Flat for 3+ runs: switch to a different phase
+- Stuck for 5+ runs: try fundamentally different approach
+
+## Multi-Objective Priority
+
+1. **ROUGE-L is primary** — maximize document quality
+2. **Slot accuracy secondary** — ensure slots are filled correctly
+3. **Loss is informative** — lower is generally better but generation metrics matter more
+4. When finishing, explicitly state trade-offs
+
+## Text Generation Notes
+
+- QLoRA: base model is 4-bit quantized, only LoRA adapters are trainable (~1-3% of params)
+- Gradient checkpointing is enabled to save memory
+- Smaller batch sizes (4-8) with gradient accumulation (4-8) work well
+- Sequence length matters: templates + generated text can be long
+- Generation evaluation is slow — it runs on a subset of eval data
+- If training OOMs: reduce batch size, seq length, or LoRA rank
+
+## Rules
+
+- ALWAYS state your hypothesis before each experiment (in the hypothesis field)
+- ALWAYS call set_hyperparameters before run_experiment
+- Use read_results to track what you've tried — don't repeat failed experiments
+- If a run fails (OOM, crash), try smaller settings (lower BS, shorter seq_len, smaller LoRA rank)
+- Call finish when you're confident you've found the best configuration
+"""
+
+
 def build_system_prompt(config: FineTuneConfig) -> str:
     """Build the system prompt that replaces program.md."""
+    if config.task == "text-generation":
+        return _build_text_generation_system_prompt(config)
+
     models_str = ", ".join(config.candidate_models)
     size_limit = f"{config.max_model_size_mb} MB" if config.max_model_size_mb else "none"
     speed_limit = f"{config.max_inference_ms} ms/sample" if config.max_inference_ms else "none"
@@ -440,6 +528,15 @@ class Orchestrator:
             r'^(GRADIENT_ACCUMULATION_STEPS\s*=\s*).*': f'GRADIENT_ACCUMULATION_STEPS = {hp.gradient_accumulation_steps}',
             r'^(LR_SCHEDULER\s*=\s*).*': f'LR_SCHEDULER = "{hp.lr_scheduler}"',
         }
+
+        # Add LoRA replacements for text-generation
+        if self.config.task == "text-generation":
+            replacements.update({
+                r'^(LORA_RANK\s*=\s*).*': f'LORA_RANK = {hp.lora_rank}',
+                r'^(LORA_ALPHA\s*=\s*).*': f'LORA_ALPHA = {hp.lora_alpha}',
+                r'^(LORA_DROPOUT\s*=\s*).*': f'LORA_DROPOUT = {hp.lora_dropout}',
+                r'^(MAX_NEW_TOKENS\s*=\s*).*': f'MAX_NEW_TOKENS = {hp.max_new_tokens}',
+            })
 
         for pattern, replacement in replacements.items():
             content = re.sub(pattern, replacement, content, flags=re.MULTILINE)
